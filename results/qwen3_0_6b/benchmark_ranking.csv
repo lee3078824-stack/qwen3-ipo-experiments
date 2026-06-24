@@ -1,0 +1,12 @@
+model,mean_score
+ratio=0.6,0.53852
+ratio=0.7,0.53832
+ratio=0.8,0.5373399999999999
+IPO,0.5343800000000001
+standard_ipo+mean,0.53174
+standard_ipo+sqrt,0.5307799999999999
+target_ratio+sqrt=0.8,0.53032
+target_ratio+mean=0.8,0.5299400000000001
+target_ratio+sqrt=0.7,0.52922
+target_ratio+mean=0.7,0.5193800000000001
+DPO,0.47368000000000005

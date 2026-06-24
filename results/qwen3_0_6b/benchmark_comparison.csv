@@ -1,0 +1,6 @@
+Task,Metric,IPO,DPO,ratio=0.6,ratio=0.7,ratio=0.8,standard_ipo+mean,standard_ipo+sqrt,target_ratio+mean=0.7,target_ratio+mean=0.8,target_ratio+sqrt=0.7,target_ratio+sqrt=0.8
+ARC-Challenge,acc_norm,0.3968,0.343,0.4027,0.4087,0.4044,0.3933,0.3993,0.3908,0.3993,0.4019,0.3985
+ARC-Easy,acc_norm,0.67,0.5589,0.6612,0.6498,0.6389,0.6423,0.6271,0.5934,0.6237,0.6242,0.6275
+HellaSwag,acc_norm,0.554,0.474,0.565,0.5681,0.5707,0.5572,0.5605,0.5541,0.5571,0.558,0.558
+TruthfulQA MC2,acc,0.4576,0.4305,0.4789,0.4904,0.4957,0.4937,0.494,0.4864,0.4903,0.4953,0.4946
+Winogrande,acc,0.5935,0.562,0.5848,0.5746,0.577,0.5722,0.573,0.5722,0.5793,0.5667,0.573

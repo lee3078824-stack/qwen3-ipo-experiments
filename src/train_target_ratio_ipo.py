@@ -1,0 +1,271 @@
+import argparse
+from pathlib import Path
+
+import torch
+from datasets import load_dataset
+from transformers import AutoTokenizer
+from trl import DPOConfig, DPOTrainer
+from trl.trainer.dpo_trainer import (
+    disable_gradient_checkpointing,
+    entropy_from_logits,
+    is_peft_model,
+    selective_log_softmax,
+    use_adapter,
+)
+
+
+class TargetRatioIPOTrainer(DPOTrainer):
+    def __init__(self, *args, target_ratio: float = 0.7, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not (0.5 < target_ratio < 1.0):
+            raise ValueError("target_ratio must be between 0.5 and 1.0")
+        self.target_ratio = target_ratio
+
+    def _compute_loss(self, model, inputs, return_outputs):
+        mode = "train" if self.model.training else "eval"
+
+        non_model_keys = {"completion_mask", "ref_chosen_logps", "ref_rejected_logps"}
+        model_kwargs = {k: v for k, v in inputs.items() if k not in non_model_keys}
+        model_kwargs["use_cache"] = False
+        outputs = model(**model_kwargs)
+
+        input_ids = inputs["input_ids"]
+        completion_mask = inputs["completion_mask"]
+        shift_logits = outputs.logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        shift_completion_mask = completion_mask[..., 1:].contiguous()
+
+        per_token_logps = selective_log_softmax(shift_logits, shift_labels)
+        per_token_logps[shift_completion_mask == 0] = 0.0
+        policy_logps = per_token_logps.sum(dim=1)
+        policy_chosen_logps, policy_rejected_logps = policy_logps.chunk(2, dim=0)
+
+        if self.precompute_ref_logps:
+            ref_chosen_logps = inputs["ref_chosen_logps"]
+            ref_rejected_logps = inputs["ref_rejected_logps"]
+        else:
+            with torch.no_grad(), disable_gradient_checkpointing(
+                self.model,
+                self.args.gradient_checkpointing_kwargs,
+            ):
+                if is_peft_model(model) and self.ref_model is None:
+                    unwrapped_model = self.accelerator.unwrap_model(model)
+                    with use_adapter(
+                        unwrapped_model,
+                        adapter_name="ref" if "ref" in unwrapped_model.peft_config else None,
+                    ):
+                        ref_outputs = self.model(**model_kwargs)
+                else:
+                    ref_outputs = self.ref_model(**model_kwargs)
+
+            ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
+            ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)
+            ref_per_token_logps[shift_completion_mask == 0] = 0.0
+            ref_logps = ref_per_token_logps.sum(dim=1)
+            ref_chosen_logps, ref_rejected_logps = ref_logps.chunk(2, dim=0)
+
+        policy_logratio = policy_chosen_logps - policy_rejected_logps
+        reference_logratio = ref_chosen_logps - ref_rejected_logps
+        gap = policy_logratio - reference_logratio
+
+        target = torch.logit(
+            torch.tensor(self.target_ratio, device=gap.device, dtype=gap.dtype)
+        )
+        loss = ((self.beta * gap - target) ** 2).mean()
+
+        self._log_target_ratio_metrics(
+            mode=mode,
+            inputs=inputs,
+            shift_logits=shift_logits,
+            shift_labels=shift_labels,
+            shift_completion_mask=shift_completion_mask,
+            policy_chosen_logps=policy_chosen_logps,
+            policy_rejected_logps=policy_rejected_logps,
+            ref_chosen_logps=ref_chosen_logps,
+            ref_rejected_logps=ref_rejected_logps,
+            gap=gap,
+        )
+
+        return (loss, outputs) if return_outputs else loss
+
+    def _log_target_ratio_metrics(
+        self,
+        *,
+        mode,
+        inputs,
+        shift_logits,
+        shift_labels,
+        shift_completion_mask,
+        policy_chosen_logps,
+        policy_rejected_logps,
+        ref_chosen_logps,
+        ref_rejected_logps,
+        gap,
+    ):
+        per_token_entropy = entropy_from_logits(shift_logits.detach())
+        mask = shift_completion_mask
+        entropy_sum = (per_token_entropy * mask).sum()
+        total_tokens = mask.sum()
+        entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
+        total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
+        entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
+        self._metrics[mode]["entropy"].append(entropy)
+
+        if mode == "train":
+            num_tokens_in_batch = (
+                self.accelerator.gather_for_metrics(inputs["attention_mask"].sum())
+                .sum()
+                .item()
+            )
+            self._total_train_tokens += num_tokens_in_batch
+        self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
+
+        chosen_logits, rejected_logits = shift_logits.detach().chunk(2, dim=0)
+        chosen_mask, rejected_mask = shift_completion_mask.chunk(2, dim=0)
+        total_chosen_logits = chosen_logits[chosen_mask.bool()].mean(-1).sum()
+        total_chosen_tokens = chosen_mask.sum()
+        total_rejected_logits = rejected_logits[rejected_mask.bool()].mean(-1).sum()
+        total_rejected_tokens = rejected_mask.sum()
+        total_chosen_logits = self.accelerator.gather_for_metrics(total_chosen_logits).sum().item()
+        total_chosen_tokens = self.accelerator.gather_for_metrics(total_chosen_tokens).sum().item()
+        total_rejected_logits = self.accelerator.gather_for_metrics(total_rejected_logits).sum().item()
+        total_rejected_tokens = self.accelerator.gather_for_metrics(total_rejected_tokens).sum().item()
+        self._metrics[mode]["logits/chosen"].append(
+            total_chosen_logits / total_chosen_tokens if total_chosen_tokens > 0 else 0.0
+        )
+        self._metrics[mode]["logits/rejected"].append(
+            total_rejected_logits / total_rejected_tokens if total_rejected_tokens > 0 else 0.0
+        )
+
+        predictions = chosen_logits.argmax(dim=-1)
+        chosen_labels = shift_labels[: len(shift_labels) // 2]
+        correct_predictions = (predictions == chosen_labels) & chosen_mask.bool()
+        correct_tokens = self.accelerator.gather_for_metrics(correct_predictions.sum())
+        total_tokens = self.accelerator.gather_for_metrics(chosen_mask.sum())
+        total_sum = total_tokens.sum()
+        accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
+        self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+
+        chosen_logratios = policy_chosen_logps - ref_chosen_logps
+        rejected_logratios = policy_rejected_logps - ref_rejected_logps
+        chosen_rewards = self.beta * chosen_logratios.detach()
+        rejected_rewards = self.beta * rejected_logratios.detach()
+        agg_chosen_rewards = self.accelerator.gather(chosen_rewards)
+        agg_rejected_rewards = self.accelerator.gather(rejected_rewards)
+        self._metrics[mode]["rewards/chosen"].append(agg_chosen_rewards.mean().item())
+        self._metrics[mode]["rewards/rejected"].append(agg_rejected_rewards.mean().item())
+        self._metrics[mode]["rewards/accuracies"].append(
+            self.accelerator.gather((chosen_rewards > rejected_rewards).float()).mean().item()
+        )
+        self._metrics[mode]["rewards/margins"].append(
+            self.accelerator.gather(chosen_rewards - rejected_rewards).mean().item()
+        )
+        self._metrics[mode]["logps/chosen"].append(
+            self.accelerator.gather(policy_chosen_logps).mean().item()
+        )
+        self._metrics[mode]["logps/rejected"].append(
+            self.accelerator.gather(policy_rejected_logps).mean().item()
+        )
+        self._metrics[mode]["target_ratio/actual"].append(
+            self.accelerator.gather(torch.sigmoid(self.beta * gap.detach())).mean().item()
+        )
+        self._metrics[mode]["target_ratio/target"].append(self.target_ratio)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_id", type=str, default="AIPlans/Qwen3-0.6b-SFT-hs2")
+    parser.add_argument("--dataset_id", type=str, default="Jennny/helpsteer2-helpfulness-preference")
+    parser.add_argument("--target_ratio", type=float, default=0.7)
+    parser.add_argument("--subset", type=int, default=0, help="0 means use the full train split")
+    parser.add_argument("--eval_subset", type=int, default=0, help="0 means use the full validation split")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--beta", type=float, default=0.01)
+    parser.add_argument("--lr", type=float, default=5e-7)
+    parser.add_argument("--train_batch_size", type=int, default=8)
+    parser.add_argument("--eval_batch_size", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--max_length", type=int, default=1024)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--save_steps", type=int, default=100)
+    parser.add_argument("--eval_steps", type=int, default=100)
+    parser.add_argument("--save_total_limit", type=int, default=3)
+    parser.add_argument("--report_to", type=str, default="wandb")
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--precompute_ref_log_probs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
+    args_cli = parser.parse_args()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args_cli.model_id,
+        trust_remote_code=True,
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dataset = load_dataset(args_cli.dataset_id)
+
+    train_dataset = dataset["train"]
+    eval_dataset = dataset["validation"]
+    if args_cli.subset > 0:
+        train_dataset = train_dataset.select(range(min(args_cli.subset, len(train_dataset))))
+    if args_cli.eval_subset > 0:
+        eval_dataset = eval_dataset.select(range(min(args_cli.eval_subset, len(eval_dataset))))
+
+    out_dir = args_cli.output_dir or f"./outputs/qwen3_target_ratio_ipo_{args_cli.target_ratio}"
+    run_name = args_cli.run_name or Path(out_dir).name
+
+    training_args = DPOConfig(
+        output_dir=out_dir,
+        loss_type="ipo",
+        beta=args_cli.beta,
+        learning_rate=args_cli.lr,
+
+        num_train_epochs=args_cli.epochs,
+        per_device_train_batch_size=args_cli.train_batch_size,
+        per_device_eval_batch_size=args_cli.eval_batch_size,
+        gradient_accumulation_steps=args_cli.gradient_accumulation_steps,
+
+        max_length=args_cli.max_length,
+
+        bf16=True,
+        optim="adamw_torch",
+        logging_steps=args_cli.logging_steps,
+        save_steps=args_cli.save_steps,
+        eval_steps=args_cli.eval_steps,
+        eval_strategy="steps",
+        save_strategy="steps",
+        save_total_limit=args_cli.save_total_limit,
+
+        report_to=args_cli.report_to,
+        run_name=run_name,
+        remove_unused_columns=False,
+        precompute_ref_log_probs=args_cli.precompute_ref_log_probs,
+        precompute_ref_batch_size=args_cli.eval_batch_size,
+
+        model_init_kwargs={
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": True,
+        },
+    )
+
+    trainer = TargetRatioIPOTrainer(
+        model=args_cli.model_id,
+        ref_model=None,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        processing_class=tokenizer,
+        target_ratio=args_cli.target_ratio,
+    )
+
+    trainer.train(resume_from_checkpoint=args_cli.resume_from_checkpoint)
+    trainer.save_model(f"{out_dir}/final")
+    tokenizer.save_pretrained(f"{out_dir}/final")
+    print(f"Saved final model and tokenizer to {out_dir}/final")
+
+
+if __name__ == "__main__":
+    main()

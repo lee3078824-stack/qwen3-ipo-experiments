@@ -1,0 +1,6 @@
+Task,Metric,IPO,DPO,변형-IPO
+ARC-Challenge,acc_norm,0.3968,0.343,0.4002
+ARC-Easy,acc_norm,0.67,0.5589,0.6675
+HellaSwag,acc_norm,0.554,0.474,0.553
+TruthfulQA MC2,acc,0.4576,0.4305,0.4592
+Winogrande,acc,0.5935,0.562,0.5904
